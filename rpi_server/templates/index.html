@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ultrasonic Radar Dashboard</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Courier New', monospace;
+            background: #000;
+            color: #0f0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        h1 {
+            margin-bottom: 20px;
+            text-shadow: 0 0 10px #0f0;
+        }
+        
+        #radarContainer {
+            position: relative;
+            width: 600px;
+            height: 350px;
+            background: #000;
+            border: 2px solid #0f0;
+            border-radius: 10px;
+            box-shadow: 0 0 20px #0f0;
+        }
+        
+        canvas {
+            display: block;
+        }
+        
+        #info {
+            margin-top: 20px;
+            padding: 15px;
+            background: #001100;
+            border: 1px solid #0f0;
+            border-radius: 5px;
+            min-width: 300px;
+            text-align: center;
+            box-shadow: 0 0 10px #0f0;
+        }
+        
+        #info div {
+            margin: 8px 0;
+            font-size: 18px;
+        }
+        
+        .label {
+            color: #0a0;
+            font-weight: bold;
+        }
+        
+        .value {
+            color: #0f0;
+            text-shadow: 0 0 5px #0f0;
+        }
+        
+        #status {
+            margin-top: 10px;
+            padding: 10px;
+            background: #001100;
+            border: 1px solid #0f0;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        .connected {
+            color: #0f0;
+        }
+        
+        .disconnected {
+            color: #f00;
+        }
+    </style>
+</head>
+<body>
+    <h1>🛰️ ULTRASONIC RADAR SYSTEM</h1>
+    
+    <div id="radarContainer">
+        <canvas id="radarCanvas" width="600" height="350"></canvas>
+    </div>
+    
+    <div id="info">
+        <div><span class="label">ANGLE:</span> <span class="value" id="angle">180°</span></div>
+        <div><span class="label">DISTANCE:</span> <span class="value" id="distance">-- cm</span></div>
+        <div><span class="label">STATUS:</span> <span class="value" id="status">Connecting...</span></div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('radarCanvas');
+        const ctx = canvas.getContext('2d');
+        const angleDisplay = document.getElementById('angle');
+        const distanceDisplay = document.getElementById('distance');
+        const statusDisplay = document.getElementById('status');
+        
+        // Radar configuration
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height - 50;
+        const maxRadius = 250;
+        const maxDistance = 200; // cm
+        
+        // Blip history for trail effect
+        const blipHistory = [];
+        const maxBlipAge = 30; // frames
+        
+        // Connect to WebSocket
+        const socket = io();
+        
+        socket.on('connect', () => {
+            statusDisplay.textContent = 'Connected';
+            statusDisplay.className = 'value connected';
+        });
+        
+        socket.on('disconnect', () => {
+            statusDisplay.textContent = 'Disconnected';
+            statusDisplay.className = 'value disconnected';
+        });
+        
+        socket.on('radar_update', (data) => {
+            updateRadar(data.angle, data.distance);
+        });
+        
+        function drawRadarGrid() {
+            ctx.strokeStyle = '#0a0';
+            ctx.lineWidth = 1;
+            
+            // Draw circles
+            for (let r = 50; r <= maxRadius; r += 50) {
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, r, Math.PI, 0, false);
+                ctx.stroke();
+            }
+            
+            // Draw radial lines
+            for (let angle = 180; angle <= 360; angle += 30) {
+                const rad = (angle * Math.PI) / 180;
+                const x = centerX + maxRadius * Math.cos(rad);
+                const y = centerY + maxRadius * Math.sin(rad);
+                
+                ctx.beginPath();
+                ctx.moveTo(centerX, centerY);
+                ctx.lineTo(x, y);
+                ctx.stroke();
+            }
+            
+            // Draw horizontal base line
+            ctx.beginPath();
+            ctx.moveTo(centerX - maxRadius, centerY);
+            ctx.lineTo(centerX + maxRadius, centerY);
+            ctx.stroke();
+            
+            // Draw distance labels
+            ctx.fillStyle = '#0a0';
+            ctx.font = '12px Courier New';
+            ctx.fillText('50cm', centerX - 40, centerY - 50);
+            ctx.fillText('100cm', centerX - 40, centerY - 100);
+            ctx.fillText('150cm', centerX - 40, centerY - 150);
+            ctx.fillText('200cm', centerX - 40, centerY - 200);
+        }
+        
+        function updateRadar(angle, distance) {
+            // Clear canvas
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            // Draw grid
+            drawRadarGrid();
+            
+            // Update displays
+            angleDisplay.textContent = angle + '°';
+            distanceDisplay.textContent = distance > 0 ? distance.toFixed(1) + ' cm' : '-- cm';
+            
+            // Draw sweep line
+            const rad = (angle * Math.PI) / 180;
+            const sweepX = centerX + maxRadius * Math.cos(rad);
+            const sweepY = centerY + maxRadius * Math.sin(rad);
+            
+            ctx.strokeStyle = '#0f0';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(centerX, centerY);
+            ctx.lineTo(sweepX, sweepY);
+            ctx.stroke();
+            
+            // Draw blip if valid distance
+            if (distance > 0 && distance < maxDistance) {
+                const blipRadius = (distance / maxDistance) * maxRadius;
+                const blipX = centerX + blipRadius * Math.cos(rad);
+                const blipY = centerY + blipRadius * Math.sin(rad);
+                
+                // Add to history
+                blipHistory.push({
+                    x: blipX,
+                    y: blipY,
+                    age: 0
+                });
+                
+                // Keep history size limited
+                if (blipHistory.length > 100) {
+                    blipHistory.shift();
+                }
+            }
+            
+            // Draw blip trail with fading effect
+            blipHistory.forEach((blip, index) => {
+                const alpha = 1 - (blip.age / maxBlipAge);
+                if (alpha > 0) {
+                    ctx.fillStyle = `rgba(255, 0, 0, ${alpha})`;
+                    ctx.beginPath();
+                    ctx.arc(blip.x, blip.y, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    blip.age++;
+                }
+            });
+            
+            // Remove old blips
+            for (let i = blipHistory.length - 1; i >= 0; i--) {
+                if (blipHistory[i].age > maxBlipAge) {
+                    blipHistory.splice(i, 1);
+                }
+            }
+        }
+        
+        // Initial render
+        drawRadarGrid();
+    </script>
+</body>
+</html>
