@@ -1,13 +1,23 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <math.h>
+#include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/event_groups.h>
 #include <ultrasonic.h>
 #include <ssd1351.h>
 #include <esp_err.h>
 #include "esp_log.h"
-#include "driver/uart.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_http_client.h"
+
+// WiFi Configuration - CHANGE THESE!
+#define WIFI_SSID      "BadeshaHome"
+#define WIFI_PASS      "Canucks@2011"
+#define RPI_SERVER_URL "http://192.168.1.90:5000/api/radar"
 
 #define MAX_DISTANCE_CM 200 // 2m max for display scaling
 #define TRIGGER_GPIO 5
@@ -21,15 +31,61 @@
 #define OLED_DC      27
 #define OLED_RST     26
 
-// UART Pins (UART0 - USB)
-#define UART_NUM     UART_NUM_0
-#define UART_BAUD    115200
+// WiFi event group
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
 
 static const char *TAG = "radar_sensor";
 
 // Shared state
 volatile float current_distance_cm = -1.0;
 volatile int current_angle = 180;
+volatile bool wifi_connected = false;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "WiFi disconnected, reconnecting...");
+        wifi_connected = false;
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_connected = true;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+    
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(TAG, "WiFi initialized. Connecting to %s...", WIFI_SSID);
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+}
 
 void draw_circle(ssd1351_t *dev, int x0, int y0, int radius, uint16_t color) {
     int x = radius;
@@ -151,10 +207,27 @@ void display_task(void *pvParameters)
             ssd1351_fill_rect(&dev, bx-2, by-2, 5, 5, COLOR_RED);
         }
 
-        // Send data to RPi via UART (JSON format)
-        char uart_msg[64];
-        snprintf(uart_msg, sizeof(uart_msg), "{\"angle\":%d,\"distance\":%.1f}\n", angle, current_distance_cm);
-        uart_write_bytes(UART_NUM, uart_msg, strlen(uart_msg));
+        // Send data to RPi via WiFi HTTP POST
+        if (wifi_connected) {
+            char post_data[64];
+            snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", angle, current_distance_cm);
+            
+            esp_http_client_config_t config = {
+                .url = RPI_SERVER_URL,
+                .method = HTTP_METHOD_POST,
+            };
+            
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_post_field(client, post_data, strlen(post_data));
+            
+            esp_err_t err = esp_http_client_perform(client);
+            if (err != ESP_OK) {
+                ESP_LOGD(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
+            }
+            
+            esp_http_client_cleanup(client);
+        }
 
         // Update angle (Ping-Pong sweep)
         angle += step;
@@ -170,20 +243,19 @@ void app_main()
 {
     ESP_LOGI(TAG, "Radar Sensor Starting...");
     
-    // Configure UART
-    uart_config_t uart_config = {
-        .baud_rate = UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    uart_driver_install(UART_NUM, 1024, 0, 0, NULL, 0);
-    uart_param_config(UART_NUM, &uart_config);
+    // Initialize NVS (required for WiFi)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
     
-    ESP_LOGI(TAG, "UART initialized on UART0 @ %d baud", UART_BAUD);
+    // Initialize WiFi
+    wifi_init();
+    
+    ESP_LOGI(TAG, "WiFi connected! Starting tasks...");
     
     xTaskCreate(sensor_task, "sensor_task", 2048, NULL, 5, NULL);
-    xTaskCreate(display_task, "display_task", 4096, NULL, 5, NULL);
+    xTaskCreate(display_task, "display_task", 8192, NULL, 5, NULL);
 }

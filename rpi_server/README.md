@@ -4,25 +4,19 @@
 
 1. Install Python dependencies:
 ```bash
-pip3 install flask flask-socketio pyserial
+pip3 install flask flask-socketio
 ```
 
-2. Find your USB-UART device:
+2. Find your Raspberry Pi's IP address:
 ```bash
-ls /dev/ttyUSB*
-# or
-ls /dev/ttyACM*
+hostname -I
 ```
 
-3. Update `radar_server.py` if needed:
-```python
-SERIAL_PORT = '/dev/ttyUSB0'  # Change this to your port
-```
-
-4. Give yourself permission to access the serial port:
-```bash
-sudo usermod -a -G dialout $USER
-# Then log out and back in
+3. Update ESP32 code with your WiFi credentials and RPi IP:
+```c
+#define WIFI_SSID      "YOUR_WIFI_SSID"
+#define WIFI_PASS      "YOUR_WIFI_PASSWORD"
+#define RPI_SERVER_URL "http://192.168.1.100:5000/api/radar"  // Change to your RPi IP
 ```
 
 ## Running the Server
@@ -38,22 +32,27 @@ The dashboard will be available at:
 
 ## ESP32 Connection
 
-Connect your ESP32 USB cable to the Raspberry Pi. The ESP32 will send JSON data over UART0:
+The ESP32 connects to your WiFi network and sends HTTP POST requests with JSON data:
 ```json
 {"angle":270,"distance":45.3}
 ```
 
+To endpoint: `http://[YOUR_RPI_IP]:5000/api/radar`
+
 ## Troubleshooting
 
-### Port Permission Denied
+### ESP32 Won't Connect to WiFi
+- Double-check SSID and password in `main/radar_sensor.c`
+- Ensure your WiFi is 2.4GHz (ESP32 doesn't support 5GHz)
+- Check serial monitor for WiFi connection logs
+
+### No Data on Dashboard
+- Verify RPi and ESP32 are on the same network
+- Check ESP32 is using correct RPi IP address
+- Look for HTTP POST errors in ESP32 serial output
+- Test the endpoint: `curl -X POST http://[RPI-IP]:5000/api/radar -H "Content-Type: application/json" -d '{"angle":270,"distance":50}'`
+
+### Firewall Issues
 ```bash
-sudo chmod 666 /dev/ttyUSB0
+sudo ufw allow 5000/tcp
 ```
-
-### Port Not Found
-Check with `dmesg | grep tty` after plugging in the ESP32.
-
-### No Data
-- Verify ESP32 is flashed with the latest code
-- Check baud rate matches (115200)
-- Test serial connection: `cat /dev/ttyUSB0`

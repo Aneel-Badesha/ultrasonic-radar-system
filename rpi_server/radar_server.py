@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
 Raspberry Pi Flask Server for Ultrasonic Radar Visualization
-Receives angle and distance data from ESP32 via UART and displays it on a web dashboard.
+Receives angle and distance data from ESP32 via WiFi HTTP POST and displays it on a web dashboard.
 """
 
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
-import serial
 import json
-import threading
 import time
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
-
-# Serial configuration
-SERIAL_PORT = '/dev/ttyUSB0'  # Change to your USB-UART adapter port
-BAUD_RATE = 115200
 
 # Global data storage
 radar_data = {
@@ -24,6 +18,23 @@ radar_data = {
     'distance': -1.0,
     'timestamp': time.time()
 }
+
+@app.route('/api/radar', methods=['POST'])
+def receive_radar_data():
+    """API endpoint to receive radar data from ESP32 via WiFi."""
+    try:
+        data = request.get_json()
+        radar_data['angle'] = data.get('angle', 180)
+        radar_data['distance'] = data.get('distance', -1.0)
+        radar_data['timestamp'] = time.time()
+        
+        # Broadcast to all connected clients
+        socketio.emit('radar_update', radar_data)
+        
+        return jsonify({'status': 'success'}), 200
+    except Exception as e:
+        print(f"Error receiving data: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 400
 
 def read_serial():
     """Background thread to read serial data from ESP32."""
@@ -64,11 +75,8 @@ def get_data():
     return jsonify(radar_data)
 
 if __name__ == '__main__':
-    # Start serial reader thread
-    serial_thread = threading.Thread(target=read_serial, daemon=True)
-    serial_thread.start()
-    
     # Start Flask server
     print("Starting Radar Dashboard Server...")
     print("Open http://localhost:5000 in your browser")
+    print("ESP32 should POST data to http://[YOUR_IP]:5000/api/radar")
     socketio.run(app, host='0.0.0.0', port=5000, debug=False)
