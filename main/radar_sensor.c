@@ -243,7 +243,7 @@ void app_main()
 {
     ESP_LOGI(TAG, "Radar Sensor Starting...");
     
-    // Initialize NVS (required for WiFi)
+    // Initialize NVS for WiFi
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
