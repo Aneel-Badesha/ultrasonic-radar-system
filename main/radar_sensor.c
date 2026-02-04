@@ -5,6 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
+#include <freertos/semphr.h>
 #include <ultrasonic.h>
 #include <ssd1351.h>
 #include <esp_err.h>
@@ -23,6 +24,18 @@
 #define TRIGGER_GPIO 5
 #define ECHO_GPIO 18
 
+// Task Configuration
+#define SENSOR_TASK_STACK_SIZE    2048
+#define DISPLAY_TASK_STACK_SIZE   8192
+#define TASK_PRIORITY             5
+#define SENSOR_UPDATE_RATE_MS     100
+#define DISPLAY_UPDATE_RATE_MS    10
+
+// Radar Sweep Configuration
+#define SWEEP_ANGLE_START         180
+#define SWEEP_ANGLE_END           360
+#define SWEEP_ANGLE_STEP          2
+
 // OLED Pins (HSPI / SPI2)
 #define OLED_HOST    SPI2_HOST
 #define OLED_MOSI    13
@@ -37,7 +50,8 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static const char *TAG = "radar_sensor";
 
-// Shared state
+// Shared state (protected by mutex)
+static SemaphoreHandle_t distance_mutex;
 volatile float current_distance_cm = -1.0;
 volatile int current_angle = 180;
 volatile bool wifi_connected = false;
@@ -126,13 +140,19 @@ void sensor_task(void *pvParameters)
     {
         float distance;
         esp_err_t res = ultrasonic_measure(&sensor, MAX_DISTANCE_CM, &distance);
-        if (res == ESP_OK) {
-            current_distance_cm = distance * 100; // Convert to cm
-            // printf("Dist: %.1f cm\n", current_distance_cm);
-        } else {
-            current_distance_cm = -1.0;
+        
+        // Update shared variable with mutex protection
+        if (xSemaphoreTake(distance_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (res == ESP_OK) {
+                current_distance_cm = distance * 100; // Convert to cm
+                // printf("Dist: %.1f cm\n", current_distance_cm);
+            } else {
+                current_distance_cm = -1.0;
+            }
+            xSemaphoreGive(distance_mutex);
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_UPDATE_RATE_MS));
     }
 }
 
@@ -162,8 +182,8 @@ void display_task(void *pvParameters)
     ssd1351_draw_line(&dev, cx, cy, cx - 42, cy - 42, 0x03E0);
     ssd1351_draw_line(&dev, cx, cy, cx + 42, cy - 42, 0x03E0);
 
-    int angle = 180;
-    int step = 2;
+    int angle = SWEEP_ANGLE_START;
+    int step = SWEEP_ANGLE_STEP;
     int prev_x = cx - 60, prev_y = cy;
     
     while (true)
@@ -194,10 +214,17 @@ void display_task(void *pvParameters)
         // Update shared angle for UART transmission
         current_angle = angle;
 
+        // Read distance with mutex protection
+        float local_distance = -1.0;
+        if (xSemaphoreTake(distance_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            local_distance = current_distance_cm;
+            xSemaphoreGive(distance_mutex);
+        }
+
         // Draw Blip at current angle if distance is valid
-        if (current_distance_cm > 0 && current_distance_cm < MAX_DISTANCE_CM) {
+        if (local_distance > 0 && local_distance < MAX_DISTANCE_CM) {
             // Map distance to pixels
-            int r = (int)((current_distance_cm / MAX_DISTANCE_CM) * max_radius);
+            int r = (int)((local_distance / MAX_DISTANCE_CM) * max_radius);
             
             // Calculate blip position along the CURRENT sweep line
             int bx = cx + (int)(r * cos(rad));
@@ -210,7 +237,7 @@ void display_task(void *pvParameters)
         // Send data to RPi via WiFi HTTP POST
         if (wifi_connected) {
             char post_data[64];
-            snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", angle, current_distance_cm);
+            snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", angle, local_distance);
             
             esp_http_client_config_t config = {
                 .url = RPI_SERVER_URL,
@@ -229,13 +256,13 @@ void display_task(void *pvParameters)
             esp_http_client_cleanup(client);
         }
 
-        // Update angle (Ping-Pong sweep)
+        // Update angle (Ping-Pong sweep) - Fixed boundary condition
         angle += step;
-        if (angle >= 360 || angle <= 180) {
+        if (angle > SWEEP_ANGLE_END || angle < SWEEP_ANGLE_START) {
             step = -step; // Reverse direction
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_UPDATE_RATE_MS));
     }
 }
 
@@ -251,11 +278,18 @@ void app_main()
     }
     ESP_ERROR_CHECK(ret);
     
+    // Create mutex for shared data protection
+    distance_mutex = xSemaphoreCreateMutex();
+    if (distance_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create distance mutex");
+        return;
+    }
+    
     // Initialize WiFi
     wifi_init();
     
     ESP_LOGI(TAG, "WiFi connected! Starting tasks...");
     
-    xTaskCreate(sensor_task, "sensor_task", 2048, NULL, 5, NULL);
-    xTaskCreate(display_task, "display_task", 8192, NULL, 5, NULL);
+    xTaskCreate(sensor_task, "sensor_task", SENSOR_TASK_STACK_SIZE, NULL, TASK_PRIORITY, NULL);
+    xTaskCreate(display_task, "display_task", DISPLAY_TASK_STACK_SIZE, NULL, TASK_PRIORITY, NULL);
 }
