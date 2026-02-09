@@ -8,7 +8,6 @@ A real-time ultrasonic radar system built with **ESP32** microcontroller using *
 - **SSD1351 RGB OLED Display** (128x128, SPI) for local radar visualization
 - **180° Ping-Pong Sweep** animation with distance blips
 - **FreeRTOS Multi-tasking** architecture for smooth, non-blocking operation
-- **UART Data Streaming** to Raspberry Pi for remote dashboard
 - **Flask Web Dashboard** with real-time WebSocket updates
 
 ## Hardware Requirements
