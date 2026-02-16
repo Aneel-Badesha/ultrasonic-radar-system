@@ -10,7 +10,7 @@ A real-time ultrasonic radar system built with **ESP32** microcontroller using *
 - **FreeRTOS Multi-tasking** architecture for smooth, non-blocking operation
 - **Flask Web Dashboard** with real-time WebSocket updates
 
-## Hardware Requirements
+## Hardware Requirements 
 
 ### ESP32 Setup
 - ESP32 Development Board
