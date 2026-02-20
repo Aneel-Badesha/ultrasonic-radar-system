@@ -19,7 +19,7 @@ A real-time ultrasonic radar system built with **ESP32** microcontroller using *
   - ECHO → GPIO 18
 - SSD1351 128x128 RGB OLED (SPI)
   - MOSI → GPIO 13
-  - CLK → GPIO 14
+  - CLK → GPIO 14 
   - CS → GPIO 15
   - DC → GPIO 27
   - RST → GPIO 26
