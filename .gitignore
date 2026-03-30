@@ -56,3 +56,5 @@ dkms.conf
 
 # ESP-IDF build artifacts
 build/
+
+.vscode
