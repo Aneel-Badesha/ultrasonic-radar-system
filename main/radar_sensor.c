@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
@@ -50,11 +51,11 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static const char *TAG = "radar_sensor";
 
-// Shared state (protected by mutex)
+// Shared state (protected by mutex or atomics)
 static SemaphoreHandle_t distance_mutex;
 volatile float current_distance_cm = -1.0;
-volatile int current_angle = 180;
-volatile bool wifi_connected = false;
+atomic_int current_angle = 180;
+atomic_bool wifi_connected = false;
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
@@ -62,12 +63,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "WiFi disconnected, reconnecting...");
-        wifi_connected = false;
+        atomic_store(&wifi_connected, false);
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        wifi_connected = true;
+        atomic_store(&wifi_connected, true);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -211,8 +212,8 @@ void display_task(void *pvParameters)
         prev_x = x;
         prev_y = y;
 
-        // Update shared angle for UART transmission
-        current_angle = angle;
+        // Update shared angle
+        atomic_store(&current_angle, angle);
 
         // Read distance with mutex protection
         float local_distance = -1.0;
@@ -235,7 +236,7 @@ void display_task(void *pvParameters)
         }
 
         // Send data to RPi via WiFi HTTP POST
-        if (wifi_connected) {
+        if (atomic_load(&wifi_connected)) {
             char post_data[64];
             snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", angle, local_distance);
             
