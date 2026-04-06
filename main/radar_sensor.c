@@ -257,7 +257,7 @@ void display_task(void *pvParameters)
             esp_http_client_cleanup(client);
         }
 
-        // Update angle (Ping-Pong sweep) - Fixed boundary condition
+        // Update angle
         angle += step;
         if (angle > SWEEP_ANGLE_END || angle < SWEEP_ANGLE_START) {
             step = -step; // Reverse direction
