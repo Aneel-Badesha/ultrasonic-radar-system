@@ -6,8 +6,8 @@ Receives angle and distance data from ESP32 via WiFi HTTP POST and displays it o
 
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
-import json
 import time
+import threading
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -18,19 +18,22 @@ radar_data = {
     'distance': -1.0,
     'timestamp': time.time()
 }
+radar_data_lock = threading.Lock()
 
 @app.route('/api/radar', methods=['POST'])
 def receive_radar_data():
     """API endpoint to receive radar data from ESP32 via WiFi."""
     try:
         data = request.get_json()
-        radar_data['angle'] = data.get('angle', 180)
-        radar_data['distance'] = data.get('distance', -1.0)
-        radar_data['timestamp'] = time.time()
-        
-        # Broadcast to all connected clients
-        socketio.emit('radar_update', radar_data)
-        
+        with radar_data_lock:
+            radar_data['angle'] = data.get('angle', 180)
+            radar_data['distance'] = data.get('distance', -1.0)
+            radar_data['timestamp'] = time.time()
+            snapshot = dict(radar_data)
+
+        # Broadcast to all connected clients (outside lock)
+        socketio.emit('radar_update', snapshot)
+
         return jsonify({'status': 'success'}), 200
     except Exception as e:
         print(f"Error receiving data: {e}")

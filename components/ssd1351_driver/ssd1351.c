@@ -321,28 +321,31 @@ esp_err_t ssd1351_fill_rect(ssd1351_t *dev, uint16_t x, uint16_t y, uint16_t w, 
 }
 
 esp_err_t ssd1351_draw_line(ssd1351_t *dev, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color) {
-    int16_t dx = abs(x1 - x0);
-    int16_t dy = abs(y1 - y0);
-    int16_t sx = x0 < x1 ? 1 : -1;
-    int16_t sy = y0 < y1 ? 1 : -1;
+    // Copy to signed locals so Bresenham arithmetic (sx/sy = ±1) doesn't wrap
+    int16_t cx0 = (int16_t)x0, cy0 = (int16_t)y0;
+    int16_t cx1 = (int16_t)x1, cy1 = (int16_t)y1;
+    int16_t dx = abs(cx1 - cx0);
+    int16_t dy = abs(cy1 - cy0);
+    int16_t sx = cx0 < cx1 ? 1 : -1;
+    int16_t sy = cy0 < cy1 ? 1 : -1;
     int16_t err = dx - dy;
-    
+
     while (1) {
-        ssd1351_draw_pixel(dev, x0, y0, color);
-        
-        if (x0 == x1 && y0 == y1) break;
-        
+        ssd1351_draw_pixel(dev, (uint16_t)cx0, (uint16_t)cy0, color);
+
+        if (cx0 == cx1 && cy0 == cy1) break;
+
         int16_t e2 = 2 * err;
         if (e2 > -dy) {
             err -= dy;
-            x0 += sx;
+            cx0 += sx;
         }
         if (e2 < dx) {
             err += dx;
-            y0 += sy;
+            cy0 += sy;
         }
     }
-    
+
     return ESP_OK;
 }
 

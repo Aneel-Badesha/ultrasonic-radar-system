@@ -1,6 +1,7 @@
 #ifndef DS_GPIO_H
 #define DS_GPIO_H
 
+#include <stdbool.h>
 #include "driver/gpio.h"
 #include "esp_err.h"
 
