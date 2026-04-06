@@ -254,7 +254,7 @@ void display_task(void *pvParameters)
                 ESP_LOGD(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
             }
             
-            esp_http_client_cleanup(client);
+            esp_http_client_cleanup(client); 
         }
 
         // Update angle
