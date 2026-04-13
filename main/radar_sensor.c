@@ -238,7 +238,9 @@ void display_task(void *pvParameters)
         // Send data to RPi via WiFi HTTP POST
         if (atomic_load(&wifi_connected)) {
             char post_data[64];
-            snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", angle, local_distance);
+            // Keep display sweep in [180,360], but report [0,180] to match server validation.
+            int api_angle = angle - SWEEP_ANGLE_START;
+            snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", api_angle, local_distance);
             
             esp_http_client_config_t config = {
                 .url = RPI_SERVER_URL,
