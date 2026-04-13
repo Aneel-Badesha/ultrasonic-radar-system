@@ -1,12 +1,14 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <math.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
 #include <ultrasonic.h>
 #include <ssd1351.h>
 #include <esp_err.h>
@@ -14,6 +16,7 @@
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_system.h"
 #include "esp_http_client.h"
 
 // WiFi Configuration - CHANGE THESE!
@@ -28,9 +31,20 @@
 // Task Configuration
 #define SENSOR_TASK_STACK_SIZE    2048
 #define DISPLAY_TASK_STACK_SIZE   8192
+#define HTTP_RETRY_TASK_STACK_SIZE 4096
 #define TASK_PRIORITY             5
 #define SENSOR_UPDATE_RATE_MS     100
 #define DISPLAY_UPDATE_RATE_MS    10
+
+// HTTP Retry/Telemetry Configuration
+#define HTTP_REQUEST_TIMEOUT_MS        1200
+#define HTTP_RESPONSE_BUFFER_SIZE      192
+#define HTTP_RETRY_QUEUE_LENGTH        24
+#define HTTP_MAX_RETRIES               3
+#define HTTP_RETRY_INITIAL_BACKOFF_MS  300
+#define HTTP_RETRY_MAX_BACKOFF_MS      3000
+#define HTTP_RETRY_JITTER_MS           100
+#define HTTP_STATS_LOG_INTERVAL_MS     5000
 
 // Radar Sweep Configuration
 #define SWEEP_ANGLE_START         180
@@ -56,6 +70,182 @@ static SemaphoreHandle_t distance_mutex;
 volatile float current_distance_cm = -1.0;
 atomic_int current_angle = 180;
 atomic_bool wifi_connected = false;
+
+typedef enum {
+    HTTP_SEND_OK = 0,
+    HTTP_SEND_CLIENT_ERROR,
+    HTTP_SEND_SERVER_ERROR,
+    HTTP_SEND_TRANSPORT_ERROR
+} http_send_outcome_t;
+
+typedef struct {
+    int angle;
+    float distance;
+    uint8_t retry_count;
+} http_retry_item_t;
+
+static QueueHandle_t http_retry_queue = NULL;
+static atomic_uint http_count_2xx;
+static atomic_uint http_count_4xx;
+static atomic_uint http_count_5xx;
+static atomic_uint http_count_transport;
+static atomic_uint http_count_retries_enqueued;
+static atomic_uint http_count_retries_exhausted;
+
+static uint32_t compute_backoff_ms(uint8_t retry_count)
+{
+    uint32_t backoff = HTTP_RETRY_INITIAL_BACKOFF_MS;
+    for (uint8_t i = 0; i < retry_count && backoff < HTTP_RETRY_MAX_BACKOFF_MS; i++) {
+        backoff *= 2;
+        if (backoff > HTTP_RETRY_MAX_BACKOFF_MS) {
+            backoff = HTTP_RETRY_MAX_BACKOFF_MS;
+            break;
+        }
+    }
+
+    int jitter_window = (HTTP_RETRY_JITTER_MS * 2) + 1;
+    int jitter = ((int)(esp_random() % jitter_window)) - HTTP_RETRY_JITTER_MS;
+    int32_t jittered = (int32_t)backoff + jitter;
+    if (jittered < 0) {
+        jittered = 0;
+    }
+
+    return (uint32_t)jittered;
+}
+
+static void enqueue_retry_item(http_retry_item_t item)
+{
+    if (http_retry_queue == NULL) {
+        return;
+    }
+
+    if (xQueueSend(http_retry_queue, &item, 0) != pdTRUE) {
+        http_retry_item_t dropped;
+        if (xQueueReceive(http_retry_queue, &dropped, 0) == pdTRUE) {
+            xQueueSend(http_retry_queue, &item, 0);
+            ESP_LOGW(TAG, "Retry queue full. Dropped oldest sample (angle=%d distance=%.1f)", dropped.angle, dropped.distance);
+        }
+    }
+}
+
+static http_send_outcome_t post_radar_data_once(int api_angle, float distance, bool from_retry)
+{
+    char post_data[64];
+    char response_body[HTTP_RESPONSE_BUFFER_SIZE] = {0};
+    int response_len = 0;
+    int status_code = -1;
+
+    snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", api_angle, distance);
+
+    esp_http_client_config_t config = {
+        .url = RPI_SERVER_URL,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = HTTP_REQUEST_TIMEOUT_MS,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        atomic_fetch_add(&http_count_transport, 1);
+        ESP_LOGW(TAG, "HTTP init failed");
+        return HTTP_SEND_TRANSPORT_ERROR;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err != ESP_OK) {
+        atomic_fetch_add(&http_count_transport, 1);
+        ESP_LOGW(TAG, "HTTP transport failure%s: %s", from_retry ? " (retry)" : "", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return HTTP_SEND_TRANSPORT_ERROR;
+    }
+
+    status_code = esp_http_client_get_status_code(client);
+    response_len = esp_http_client_read_response(client, response_body, sizeof(response_body) - 1);
+    if (response_len < 0) {
+        response_len = 0;
+    }
+    response_body[response_len] = '\0';
+
+    if (status_code >= 200 && status_code < 300) {
+        atomic_fetch_add(&http_count_2xx, 1);
+        esp_http_client_cleanup(client);
+        return HTTP_SEND_OK;
+    }
+
+    if (status_code >= 400 && status_code < 500) {
+        atomic_fetch_add(&http_count_4xx, 1);
+        ESP_LOGW(TAG, "HTTP %d (client error)%s body=%s", status_code, from_retry ? " (retry)" : "", response_len > 0 ? response_body : "<empty>");
+        esp_http_client_cleanup(client);
+        return HTTP_SEND_CLIENT_ERROR;
+    }
+
+    if (status_code >= 500) {
+        atomic_fetch_add(&http_count_5xx, 1);
+        ESP_LOGW(TAG, "HTTP %d (server error)%s body=%s", status_code, from_retry ? " (retry)" : "", response_len > 0 ? response_body : "<empty>");
+        esp_http_client_cleanup(client);
+        return HTTP_SEND_SERVER_ERROR;
+    }
+
+    atomic_fetch_add(&http_count_transport, 1);
+    ESP_LOGW(TAG, "HTTP unexpected status=%d%s body=%s", status_code, from_retry ? " (retry)" : "", response_len > 0 ? response_body : "<empty>");
+    esp_http_client_cleanup(client);
+    return HTTP_SEND_TRANSPORT_ERROR;
+}
+
+void http_retry_task(void *pvParameters)
+{
+    TickType_t last_stats_log = xTaskGetTickCount();
+
+    while (true)
+    {
+        http_retry_item_t item;
+        if (xQueueReceive(http_retry_queue, &item, pdMS_TO_TICKS(200)) == pdTRUE) {
+            uint32_t wait_ms = compute_backoff_ms(item.retry_count);
+            if (wait_ms > 0) {
+                vTaskDelay(pdMS_TO_TICKS(wait_ms));
+            }
+
+            if (!atomic_load(&wifi_connected)) {
+                if (item.retry_count < HTTP_MAX_RETRIES) {
+                    item.retry_count++;
+                    atomic_fetch_add(&http_count_retries_enqueued, 1);
+                    enqueue_retry_item(item);
+                } else {
+                    atomic_fetch_add(&http_count_retries_exhausted, 1);
+                    ESP_LOGW(TAG, "Dropping sample after retries exhausted (wifi down): angle=%d distance=%.1f", item.angle, item.distance);
+                }
+                continue;
+            }
+
+            http_send_outcome_t retry_result = post_radar_data_once(item.angle, item.distance, true);
+            if (retry_result == HTTP_SEND_SERVER_ERROR || retry_result == HTTP_SEND_TRANSPORT_ERROR) {
+                if (item.retry_count < HTTP_MAX_RETRIES) {
+                    item.retry_count++;
+                    atomic_fetch_add(&http_count_retries_enqueued, 1);
+                    enqueue_retry_item(item);
+                } else {
+                    atomic_fetch_add(&http_count_retries_exhausted, 1);
+                    ESP_LOGW(TAG, "Dropping sample after retries exhausted: angle=%d distance=%.1f", item.angle, item.distance);
+                }
+            }
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_stats_log) >= pdMS_TO_TICKS(HTTP_STATS_LOG_INTERVAL_MS)) {
+            ESP_LOGI(TAG,
+                     "HTTP stats 2xx=%u 4xx=%u 5xx=%u transport=%u queued_retries=%u exhausted=%u",
+                     atomic_load(&http_count_2xx),
+                     atomic_load(&http_count_4xx),
+                     atomic_load(&http_count_5xx),
+                     atomic_load(&http_count_transport),
+                     atomic_load(&http_count_retries_enqueued),
+                     atomic_load(&http_count_retries_exhausted));
+            last_stats_log = now;
+        }
+    }
+}
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
@@ -237,26 +427,18 @@ void display_task(void *pvParameters)
 
         // Send data to RPi via WiFi HTTP POST
         if (atomic_load(&wifi_connected)) {
-            char post_data[64];
             // Keep display sweep in [180,360], but report [0,180] to match server validation.
             int api_angle = angle - SWEEP_ANGLE_START;
-            snprintf(post_data, sizeof(post_data), "{\"angle\":%d,\"distance\":%.1f}", api_angle, local_distance);
-            
-            esp_http_client_config_t config = {
-                .url = RPI_SERVER_URL,
-                .method = HTTP_METHOD_POST,
-            };
-            
-            esp_http_client_handle_t client = esp_http_client_init(&config);
-            esp_http_client_set_header(client, "Content-Type", "application/json");
-            esp_http_client_set_post_field(client, post_data, strlen(post_data));
-            
-            esp_err_t err = esp_http_client_perform(client);
-            if (err != ESP_OK) {
-                ESP_LOGD(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
+            http_send_outcome_t send_result = post_radar_data_once(api_angle, local_distance, false);
+            if (send_result == HTTP_SEND_SERVER_ERROR || send_result == HTTP_SEND_TRANSPORT_ERROR) {
+                http_retry_item_t retry_item = {
+                    .angle = api_angle,
+                    .distance = local_distance,
+                    .retry_count = 0
+                };
+                atomic_fetch_add(&http_count_retries_enqueued, 1);
+                enqueue_retry_item(retry_item);
             }
-            
-            esp_http_client_cleanup(client); 
         }
 
         // Update angle
@@ -290,6 +472,19 @@ void app_main()
     
     // Initialize WiFi
     wifi_init();
+
+    http_retry_queue = xQueueCreate(HTTP_RETRY_QUEUE_LENGTH, sizeof(http_retry_item_t));
+    if (http_retry_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create HTTP retry queue");
+        return;
+    }
+
+    xTaskCreate(http_retry_task,
+                "http_retry_task",
+                HTTP_RETRY_TASK_STACK_SIZE,
+                NULL,
+                TASK_PRIORITY - 1,
+                NULL);
     
     ESP_LOGI(TAG, "WiFi connected! Starting tasks...");
     
