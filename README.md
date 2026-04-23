@@ -116,7 +116,7 @@ Then open `http://<dashboard-host-ip>:5000` in a browser.
 1. **`sensor_task`** — reads the HC-SR04 at ~10 Hz, converts the measurement to centimeters, and publishes it to `current_distance_cm` under a mutex (`-1.0` on no echo).
 2. **`display_task`** — runs at ~100 Hz:
    - Draws the radar grid (concentric circles, radial lines) on the SSD1351.
-   - Advances a green sweep line between 180° and 360° (ping-pong).
+   - Advances a green sweep line between 0° and 180° (ping-pong).
    - Reads the latest distance under the mutex and, if valid, paints a red blip along the current sweep angle.
    - If WiFi is up, POSTs `{angle, distance}` to the dashboard. The reported angle is normalized to `[0, 180]` so it matches the server's validation domain.
    - On `5xx` or transport errors, enqueues the sample on the retry queue.
