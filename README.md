@@ -118,7 +118,7 @@ Open `http://[RPi-IP]:5000` in your browser to see the live radar dashboard.
 - **Thread Safety**: Uses `volatile` keyword for shared variables between FreeRTOS tasks
 - **Performance Optimization**: Lowered SPI clock to 1MHz for stable long-wire connections
 
-## Resume Summary
+## Summary
 
 **Real-Time Ultrasonic Radar System (ESP32)**
 - Developed a standalone radar system using **ESP32 microcontroller** and **ESP-IDF (FreeRTOS)** framework
