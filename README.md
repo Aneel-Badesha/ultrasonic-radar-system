@@ -163,9 +163,6 @@ HC-SR04 ─► ESP32 (FreeRTOS) ─► SSD1351 OLED
 - Rendered a 180° ping-pong radar sweep with polar-to-cartesian coordinate math and real-time blip placement.
 - Technologies: **C**, **FreeRTOS**, **ESP-IDF**, **SPI**, **WiFi / HTTP**, **Python**, **Flask**, **Socket.IO**.
 
-## License
-
-MIT License — see the repository license file.
 
 ## Author
 
