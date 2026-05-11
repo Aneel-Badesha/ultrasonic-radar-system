@@ -34,6 +34,9 @@ static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 esp_err_t ultrasonic_init(const ultrasonic_sensor_t *dev)
 {
     CHECK_ARG(dev);
+    CHECK_ARG(GPIO_IS_VALID_OUTPUT_GPIO(dev->trigger_pin));
+    CHECK_ARG(GPIO_IS_VALID_GPIO(dev->echo_pin));
+    CHECK_ARG(dev->trigger_pin != dev->echo_pin);
 
     CHECK(gpio_set_direction(dev->trigger_pin, GPIO_MODE_OUTPUT));
     CHECK(gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT));
@@ -48,18 +51,16 @@ esp_err_t ultrasonic_measure_raw(const ultrasonic_sensor_t *dev, uint32_t max_ti
 
     PORT_ENTER_CRITICAL;
 
-    // Ping: Low for 4 us, then high 10 us
+    // 10us trigger pulse with a 4us low guard before it
     CHECK(gpio_set_level(dev->trigger_pin, 0));
     ets_delay_us(TRIGGER_LOW_DELAY);
     CHECK(gpio_set_level(dev->trigger_pin, 1));
     ets_delay_us(TRIGGER_HIGH_DELAY);
     CHECK(gpio_set_level(dev->trigger_pin, 0));
 
-    // Previous ping isn't ended
     if (gpio_get_level(dev->echo_pin))
         RETURN_CRITICAL(ESP_ERR_ULTRASONIC_PING);
 
-    // Wait for echo
     int64_t start = esp_timer_get_time();
     while (!gpio_get_level(dev->echo_pin))
     {
@@ -67,7 +68,6 @@ esp_err_t ultrasonic_measure_raw(const ultrasonic_sensor_t *dev, uint32_t max_ti
             RETURN_CRITICAL(ESP_ERR_ULTRASONIC_PING_TIMEOUT);
     }
 
-    // got echo, measuring
     int64_t echo_start = esp_timer_get_time();
     int64_t time = echo_start;
     while (gpio_get_level(dev->echo_pin))

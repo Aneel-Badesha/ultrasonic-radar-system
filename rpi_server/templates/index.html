@@ -106,18 +106,15 @@
         const angleDisplay = document.getElementById('angle');
         const distanceDisplay = document.getElementById('distance');
         const statusDisplay = document.getElementById('status');
-        
-        // Radar configuration
+
         const centerX = canvas.width / 2;
         const centerY = canvas.height - 50;
         const maxRadius = 250;
-        const maxDistance = 200; // cm
-        
-        // Blip history for trail effect
+        const maxDistance = 200;
+
         const blipHistory = [];
-        const maxBlipAge = 30; // frames
-        
-        // Connect to WebSocket
+        const maxBlipAge = 30;
+
         const socket = io();
         
         socket.on('connect', () => {
@@ -137,33 +134,29 @@
         function drawRadarGrid() {
             ctx.strokeStyle = '#0a0';
             ctx.lineWidth = 1;
-            
-            // Draw circles
+
             for (let r = 50; r <= maxRadius; r += 50) {
                 ctx.beginPath();
                 ctx.arc(centerX, centerY, r, Math.PI, 0, false);
                 ctx.stroke();
             }
-            
-            // Draw radial lines
+
             for (let angle = 180; angle <= 360; angle += 30) {
                 const rad = (angle * Math.PI) / 180;
                 const x = centerX + maxRadius * Math.cos(rad);
                 const y = centerY + maxRadius * Math.sin(rad);
-                
+
                 ctx.beginPath();
                 ctx.moveTo(centerX, centerY);
                 ctx.lineTo(x, y);
                 ctx.stroke();
             }
-            
-            // Draw horizontal base line
+
             ctx.beginPath();
             ctx.moveTo(centerX - maxRadius, centerY);
             ctx.lineTo(centerX + maxRadius, centerY);
             ctx.stroke();
-            
-            // Draw distance labels
+
             ctx.fillStyle = '#0a0';
             ctx.font = '12px Courier New';
             ctx.fillText('50cm', centerX - 40, centerY - 50);
@@ -171,51 +164,43 @@
             ctx.fillText('150cm', centerX - 40, centerY - 150);
             ctx.fillText('200cm', centerX - 40, centerY - 200);
         }
-        
+
         function updateRadar(angle, distance) {
-            // Clear canvas
             ctx.fillStyle = '#000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
-            
-            // Draw grid
+
             drawRadarGrid();
-            
-            // Update displays
+
             angleDisplay.textContent = angle + '°';
             distanceDisplay.textContent = distance > 0 ? distance.toFixed(1) + ' cm' : '-- cm';
-            
-            // Draw sweep line
+
             const rad = (angle * Math.PI) / 180;
             const sweepX = centerX + maxRadius * Math.cos(rad);
             const sweepY = centerY + maxRadius * Math.sin(rad);
-            
+
             ctx.strokeStyle = '#0f0';
             ctx.lineWidth = 2;
             ctx.beginPath();
             ctx.moveTo(centerX, centerY);
             ctx.lineTo(sweepX, sweepY);
             ctx.stroke();
-            
-            // Draw blip if valid distance
+
             if (distance > 0 && distance < maxDistance) {
                 const blipRadius = (distance / maxDistance) * maxRadius;
                 const blipX = centerX + blipRadius * Math.cos(rad);
                 const blipY = centerY + blipRadius * Math.sin(rad);
-                
-                // Add to history
+
                 blipHistory.push({
                     x: blipX,
                     y: blipY,
                     age: 0
                 });
-                
-                // Keep history size limited
+
                 if (blipHistory.length > 100) {
                     blipHistory.shift();
                 }
             }
-            
-            // Draw blip trail with fading effect
+
             blipHistory.forEach((blip, index) => {
                 const alpha = 1 - (blip.age / maxBlipAge);
                 if (alpha > 0) {
@@ -223,20 +208,18 @@
                     ctx.beginPath();
                     ctx.arc(blip.x, blip.y, 4, 0, Math.PI * 2);
                     ctx.fill();
-                    
+
                     blip.age++;
                 }
             });
-            
-            // Remove old blips
+
             for (let i = blipHistory.length - 1; i >= 0; i--) {
                 if (blipHistory[i].age > maxBlipAge) {
                     blipHistory.splice(i, 1);
                 }
             }
         }
-        
-        // Initial render
+
         drawRadarGrid();
     </script>
 </body>

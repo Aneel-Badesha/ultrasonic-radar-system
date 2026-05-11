@@ -4,12 +4,13 @@ A real-time ultrasonic radar system built on the **ESP32** (ESP-IDF / FreeRTOS) 
 
 ## Features
 
-- **HC-SR04 Ultrasonic Sensor** for distance measurement (up to 2 m)
+- **HC-SR04 Ultrasonic Sensor** for distance measurement (up to 2 m), with plausibility checks and a 3-sample median filter
 - **SSD1351 RGB OLED Display** (128x128, SPI) for local radar visualization
 - **180° Ping-Pong Sweep** animation with distance blips
-- **FreeRTOS Multi-tasking** — separate sensor, display, and HTTP-retry tasks
+- **FreeRTOS Multi-tasking** — sensor, display, and HTTP-send tasks decoupled via a mutex and a send queue
+- **Task watchdog (TWDT)** subscribed on every task with panic-on-timeout, plus stack-canary overflow detection
 - **WiFi HTTP telemetry** from the ESP32 to the dashboard (JSON POST)
-- **Resilient delivery** — bounded retry queue with exponential backoff, jitter, and periodic stats logging
+- **Resilient delivery** — unified send queue with exponential backoff, jitter, drop-oldest overflow policy, and periodic stats logging
 - **Flask + Socket.IO dashboard** with real-time browser updates and validated API
 
 ## Hardware Requirements
@@ -40,12 +41,11 @@ A real-time ultrasonic radar system built on the **ESP32** (ESP-IDF / FreeRTOS) 
 ```
 ultrasonic-radar-system/
 ├── main/
-│   ├── radar_sensor.c          # Main application (WiFi, tasks, HTTP retry, rendering)
+│   ├── radar_sensor.c          # Main application (WiFi, tasks, HTTP send, rendering)
 │   └── CMakeLists.txt
 ├── components/
 │   ├── ultrasonic/             # HC-SR04 driver
-│   ├── ssd1351_driver/         # SSD1351 OLED driver
-│   └── gpio_driver/            # Legacy GPIO utilities
+│   └── ssd1351_driver/         # SSD1351 OLED driver
 ├── rpi_server/
 │   ├── radar_server.py         # Flask + Socket.IO server with validated /api/radar
 │   ├── templates/index.html    # Web dashboard UI
@@ -113,52 +113,55 @@ Then open `http://<dashboard-host-ip>:5000` in a browser.
 
 ### Tasks (FreeRTOS)
 
-1. **`sensor_task`** — reads the HC-SR04 at ~10 Hz, converts the measurement to centimeters, and publishes it to `current_distance_cm` under a mutex (`-1.0` on no echo).
-2. **`display_task`** — runs at ~100 Hz:
-   - Draws the radar grid (concentric circles, radial lines) on the SSD1351.
-   - Advances a green sweep line between 0° and 180° (ping-pong).
-   - Reads the latest distance under the mutex and, if valid, paints a red blip along the current sweep angle.
-   - If WiFi is up, POSTs `{angle, distance}` to the dashboard. The reported angle is normalized to `[0, 180]` so it matches the server's validation domain.
-   - On `5xx` or transport errors, enqueues the sample on the retry queue.
-3. **`http_retry_task`** — drains the retry queue with exponential backoff (300 ms → 3000 ms cap) plus ±100 ms jitter. Drops the oldest item if the queue saturates, tracks per-outcome counters, and logs a stats line every 5 s:
+1. **`sensor_task`** — reads the HC-SR04 at ~10 Hz, classifies the driver error code, applies a plausibility window (`MIN_DISTANCE_CM` ≤ d < `MAX_DISTANCE_CM`), runs a 3-sample median filter, and publishes the result to `current_sample` (distance + error class + timestamp) under a mutex. The same sample is also enqueued on `http_send_queue` with the angle captured from the atomic at the measurement instant.
+2. **`display_task`** — runs at ~100 Hz, purely as a renderer:
+   - Draws the radar grid (concentric circles, radial lines) on the SSD1351 via `draw_radar_grid`.
+   - Advances a green sweep line between 180° and 360° (ping-pong, matching the screen's Y-down orientation).
+   - Snapshots `current_sample` under the mutex, rejects readings older than `SENSOR_FRESHNESS_TIMEOUT_MS`, and paints a red blip along the current sweep angle if the distance is valid.
+3. **`http_send_task`** — drains `http_send_queue` for both first attempts (no delay) and retries (exponential backoff 300 ms → 3000 ms cap, ±100 ms jitter). Drops the oldest item on queue overflow, skips the HTTP call when WiFi is down, classifies outcomes into 2xx / 4xx / 5xx / transport (4xx is not retried), and logs a stats line every 5 s:
    ```
-   HTTP stats 2xx=… 4xx=… 5xx=… transport=… queued_retries=… exhausted=…
+   HTTP stats 2xx=… 4xx=… 5xx=… transport=… enqueued=… dropped=… exhausted=…
    ```
+
+All three tasks subscribe to the ESP-IDF task watchdog (TWDT) and feed it once per loop iteration; `CONFIG_ESP_TASK_WDT_PANIC` is enabled so a hang produces a real panic + backtrace + reset rather than a silent warning.
 
 ### Data flow
 
 ```
-HC-SR04 ─► ESP32 (FreeRTOS) ─► SSD1351 OLED
-                │
-                ├─ WiFi HTTP POST (with retry/backoff) ─► Flask /api/radar
-                │                                            │
-                │                                            ▼
-                │                                       Socket.IO broadcast
-                │                                            │
-                │                                            ▼
-                └────────────────────────────────────►  Web dashboard
+HC-SR04 ─► sensor_task ─► current_sample (mutex)   ─► display_task ─► SSD1351 OLED
+                       │
+                       └─► http_send_queue ─► http_send_task ─► Flask /api/radar
+                                                                      │
+                                                                      ▼
+                                                                Socket.IO broadcast
+                                                                      │
+                                                                      ▼
+                                                                Web dashboard
 ```
 
 ### Thread safety
 
-- `current_distance_cm` is protected by a FreeRTOS mutex (`distance_mutex`) shared between `sensor_task` and `display_task`.
+- `current_sample` (distance, error class, timestamp) is protected by a FreeRTOS mutex (`distance_mutex`) shared between `sensor_task` (writer) and `display_task` (reader).
 - `current_angle`, `wifi_connected`, and the HTTP telemetry counters use C11 `<stdatomic.h>` atomics.
-- The retry queue is a FreeRTOS `QueueHandle_t`; WiFi connection state is signaled through an `EventGroup`.
+- The send queue is a FreeRTOS `QueueHandle_t` with non-blocking enqueue and drop-oldest overflow.
+- WiFi connection state is signaled at boot through an `EventGroup` and tracked at runtime via the `wifi_connected` atomic.
 
 ## Technical Highlights
 
-- **Resilient telemetry pipeline** — bounded retry queue with exponential backoff + jitter, oldest-drop overflow policy, and outcome-class metrics (2xx / 4xx / 5xx / transport / exhausted).
-- **Decoupled rendering and acquisition** — dedicated FreeRTOS tasks keep the OLED animation smooth while sensor reads and network I/O run independently.
+- **Resilient telemetry pipeline** — unified send queue handles both first attempts and retries through one path, with exponential backoff + jitter, drop-oldest overflow, and outcome-class metrics (2xx / 4xx / 5xx / transport / enqueued / dropped / exhausted).
+- **Decoupled rendering and acquisition** — display task does zero network I/O; sensor task is the single producer feeding both the OLED renderer and the HTTP sender.
+- **Sensor-side robustness** — driver-level GPIO validation, plausibility window rejecting readings outside the HC-SR04's usable range, 3-sample median filter to kill single-sample glitches, and a freshness check on the consumer to detect a stalled sensor before the TWDT fires.
 - **Validated API surface** — the Flask server rejects malformed payloads with structured 4xx errors instead of storing bad data.
 - **Polar-to-Cartesian conversion** with `cos()` / `sin()` for the sweep animation and blip placement.
-- **SPI bus tuning** — OLED on HSPI (SPI2) with a 1 MHz clock for stable long-wire connections; avoids conflicts with the sensor GPIOs.
+- **SPI bus tuning** — OLED on HSPI (SPI2) with a 1 MHz clock for stable long-wire connections, avoiding conflicts with the sensor GPIOs.
 
 ## Summary
 
 **Real-Time Ultrasonic Radar System (ESP32)**
 - Built a standalone radar system on the **ESP32** using **ESP-IDF (FreeRTOS)**, interfacing an **HC-SR04** ultrasonic sensor and an **SSD1351 RGB OLED** over SPI.
-- Designed a multi-task architecture (sensor / display / HTTP-retry) with mutex- and atomic-based synchronization to decouple acquisition, rendering, and network I/O.
-- Implemented a **resilient WiFi telemetry pipeline** — JSON HTTP POST with a bounded retry queue, exponential backoff + jitter, and per-outcome metrics logging.
+- Designed a producer/consumer architecture: `sensor_task` is the sole producer feeding `display_task` (mutex-protected snapshot) and `http_send_task` (bounded queue), with mutex- and atomic-based synchronization throughout.
+- Implemented a **resilient WiFi telemetry pipeline** — JSON HTTP POST with a unified send queue, exponential backoff + jitter, and per-outcome metrics logging.
+- Hardened the firmware with **task watchdog (TWDT) panic-on-timeout, stack-canary overflow detection, plausibility checks, and median filtering** to surface failures loudly instead of letting them rot silently.
 - Built a **Flask + Socket.IO dashboard** with a validated ingress API and live browser updates over WebSocket.
 - Rendered a 180° ping-pong radar sweep with polar-to-cartesian coordinate math and real-time blip placement.
 - Technologies: **C**, **FreeRTOS**, **ESP-IDF**, **SPI**, **WiFi / HTTP**, **Python**, **Flask**, **Socket.IO**.

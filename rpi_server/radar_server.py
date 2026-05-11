@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-Raspberry Pi Flask Server for Ultrasonic Radar Visualization
-Receives angle and distance data from ESP32 via WiFi HTTP POST and displays it on a web dashboard.
-"""
+"""Flask + Socket.IO dashboard for the ultrasonic radar ESP32"""
 
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
@@ -14,7 +11,6 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 logger = logging.getLogger(__name__)
 
-# Global data storage
 radar_data = {
     'angle': 180,
     'distance': -1.0,
@@ -54,7 +50,6 @@ def _validate_radar_payload(data):
 
 @app.route('/api/radar', methods=['POST'])
 def receive_radar_data():
-    """API endpoint to receive radar data from ESP32 via WiFi."""
     data = request.get_json(silent=True)
     try:
         angle, distance = _validate_radar_payload(data)
@@ -70,7 +65,7 @@ def receive_radar_data():
         logger.exception("Unexpected error while processing radar data")
         return _error_response("Failed to process radar data.", 'internal_error', 500)
 
-    # Broadcast outside lock; data is already stored even if broadcast fails.
+    # Broadcast outside lock so a slow client can't stall the writer
     try:
         socketio.emit('radar_update', snapshot)
     except Exception:
@@ -84,18 +79,15 @@ def receive_radar_data():
 
 @app.route('/')
 def index():
-    """Serve the main dashboard page."""
     return render_template('index.html')
 
 @app.route('/api/data')
 def get_data():
-    """API endpoint to get current radar data."""
     with radar_data_lock:
         snapshot = dict(radar_data)
     return jsonify(snapshot)
 
 if __name__ == '__main__':
-    # Start Flask server
     print("Starting Radar Dashboard Server...")
     print("Open http://localhost:5000 in your browser")
     print("ESP32 should POST data to http://[YOUR_IP]:5000/api/radar")
