@@ -6,6 +6,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 
+// SSD1351 commands
 #define SSD1351_CMD_SETCOLUMN       0x15
 #define SSD1351_CMD_SETROW          0x75
 #define SSD1351_CMD_WRITERAM        0x5C
@@ -38,10 +39,11 @@
 #define SSD1351_CMD_STOPSCROLL      0x9E
 #define SSD1351_CMD_STARTSCROLL     0x9F
 
+// SSD1351 Max width & height in pixels
 #define SSD1351_WIDTH   128
 #define SSD1351_HEIGHT  128
 
-// RGB565
+// RGB565 color codes
 #define COLOR_BLACK     0x0000
 #define COLOR_WHITE     0xFFFF
 #define COLOR_RED       0xF800
@@ -52,30 +54,33 @@
 #define COLOR_YELLOW    0xFFE0
 #define COLOR_ORANGE    0xFC00
 
+// Per-display handle, populated by ssd1351_init and passed to every other driver call
 typedef struct {
-    spi_device_handle_t spi;
-    gpio_num_t dc_pin;
-    gpio_num_t rst_pin;
-    uint16_t width;
-    uint16_t height;
+    spi_device_handle_t spi;    // SPI device handle returned by spi_bus_add_device
+    gpio_num_t dc_pin;          // Data/Command pin, low for commands and high for data
+    gpio_num_t rst_pin;         // Hardware reset pin, set low once during init
+    uint16_t width;             // Display width in pixels
+    uint16_t height;            // Display height in pixels
 } ssd1351_t;
 
+// Initialise the SPI bus and the display, call once before any draw call
 esp_err_t ssd1351_init(ssd1351_t *dev, spi_host_device_t host,
                        gpio_num_t mosi_pin, gpio_num_t sclk_pin,
                        gpio_num_t cs_pin, gpio_num_t dc_pin, gpio_num_t rst_pin);
 
+// Paint the entire display with a single RGB565 colour
 esp_err_t ssd1351_fill_screen(ssd1351_t *dev, uint16_t color);
 
+// Set a single pixel at (x, y) to the given RGB565 colour
 esp_err_t ssd1351_draw_pixel(ssd1351_t *dev, uint16_t x, uint16_t y, uint16_t color);
 
+// Fill a w by h rectangle anchored at (x, y) with the given RGB565 colour
 esp_err_t ssd1351_fill_rect(ssd1351_t *dev, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
 
+// Draw a line from (x0, y0) to (x1, y1) using Bresenham's algorithm
 esp_err_t ssd1351_draw_line(ssd1351_t *dev, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color);
 
-esp_err_t ssd1351_draw_char(ssd1351_t *dev, uint16_t x, uint16_t y, char c, uint16_t color, uint16_t bg);
-
-esp_err_t ssd1351_draw_string(ssd1351_t *dev, uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg);
-
-uint16_t ssd1351_color565(uint8_t r, uint8_t g, uint8_t b);
+// Draw an outlined circle of the given radius centred at (x0, y0), pixels outside the panel are clipped
+esp_err_t ssd1351_draw_circle(ssd1351_t *dev, int16_t x0, int16_t y0, int16_t radius, uint16_t color);
 
 #endif

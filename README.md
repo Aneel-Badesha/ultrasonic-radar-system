@@ -7,10 +7,12 @@ A real-time ultrasonic radar system built on the **ESP32** (ESP-IDF / FreeRTOS) 
 - **HC-SR04 Ultrasonic Sensor** for distance measurement (up to 2 m), with plausibility checks and a 3-sample median filter
 - **SSD1351 RGB OLED Display** (128x128, SPI) for local radar visualization
 - **180° Ping-Pong Sweep** animation with distance blips
-- **FreeRTOS Multi-tasking** — sensor, display, and HTTP-send tasks decoupled via a mutex and a send queue
+- **FreeRTOS Multi-tasking** — sensor, display, and HTTP-uploader tasks decoupled via a mutex and a send queue
 - **Task watchdog (TWDT)** subscribed on every task with panic-on-timeout, plus stack-canary overflow detection
 - **WiFi HTTP telemetry** from the ESP32 to the dashboard (JSON POST)
+- **WiFi station component** with auto-reconnect on disconnect and a bring-up timeout that reboots if the first connection fails
 - **Resilient delivery** — unified send queue with exponential backoff, jitter, drop-oldest overflow policy, and periodic stats logging
+- **Modular component layout** — WiFi station, HTTP uploader, HC-SR04 driver, and OLED driver are each reusable ESP-IDF components
 - **Flask + Socket.IO dashboard** with real-time browser updates and validated API
 
 ## Hardware Requirements
@@ -41,11 +43,13 @@ A real-time ultrasonic radar system built on the **ESP32** (ESP-IDF / FreeRTOS) 
 ```
 ultrasonic-radar-system/
 ├── main/
-│   ├── radar_sensor.c          # Main application (WiFi, tasks, HTTP send, rendering)
+│   ├── radar_sensor.c          # App entry point, sensor and display tasks, radar rendering
 │   └── CMakeLists.txt
 ├── components/
 │   ├── ultrasonic/             # HC-SR04 driver
-│   └── ssd1351_driver/         # SSD1351 OLED driver
+│   ├── ssd1351_driver/         # SSD1351 OLED driver, includes generic line and circle primitives
+│   ├── wifi_sta/               # WiFi station bring-up, event-driven reconnect, is-connected accessor
+│   └── http_uploader/          # Queue-backed HTTP POST worker with exponential backoff and stats
 ├── rpi_server/
 │   ├── radar_server.py         # Flask + Socket.IO server with validated /api/radar
 │   ├── templates/index.html    # Web dashboard UI
@@ -113,12 +117,12 @@ Then open `http://<dashboard-host-ip>:5000` in a browser.
 
 ### Tasks (FreeRTOS)
 
-1. **`sensor_task`** — reads the HC-SR04 at ~10 Hz, classifies the driver error code, applies a plausibility window (`MIN_DISTANCE_CM` ≤ d < `MAX_DISTANCE_CM`), runs a 3-sample median filter, and publishes the result to `current_sample` (distance + error class + timestamp) under a mutex. The same sample is also enqueued on `http_send_queue` with the angle captured from the atomic at the measurement instant.
-2. **`display_task`** — runs at ~100 Hz, purely as a renderer:
+1. **`sensor_task`** (in `main/`) — reads the HC-SR04 at ~10 Hz, classifies the driver error code, applies a plausibility window (`MIN_DISTANCE_CM` ≤ d ≤ `MAX_DISTANCE_CM`), runs a 3-sample median filter, and publishes the result to `current_sample` (distance + error class + timestamp) under a mutex. The same sample is also handed to `http_uploader_enqueue` with the angle captured at the measurement instant.
+2. **`display_task`** (in `main/`) — runs at ~100 Hz, purely as a renderer:
    - Draws the radar grid (concentric circles, radial lines) on the SSD1351 via `draw_radar_grid`.
    - Advances a green sweep line between 180° and 360° (ping-pong, matching the screen's Y-down orientation).
-   - Snapshots `current_sample` under the mutex, rejects readings older than `SENSOR_FRESHNESS_TIMEOUT_MS`, and paints a red blip along the current sweep angle if the distance is valid.
-3. **`http_send_task`** — drains `http_send_queue` for both first attempts (no delay) and retries (exponential backoff 300 ms → 3000 ms cap, ±100 ms jitter). Drops the oldest item on queue overflow, skips the HTTP call when WiFi is down, classifies outcomes into 2xx / 4xx / 5xx / transport (4xx is not retried), and logs a stats line every 5 s:
+   - Snapshots `current_sample` under the mutex, skips the frame's blip if the mutex isn't acquired within 50 ms, rejects readings older than `SENSOR_FRESHNESS_TIMEOUT_MS`, and paints a red blip along the current sweep angle if the distance is valid.
+3. **`http_uploader_task`** (in the `http_uploader` component) — drains the internal queue for both first attempts (no delay) and retries (exponential backoff 300 ms → 3000 ms cap, ±100 ms jitter). Drops the oldest item on queue overflow, short-circuits when `wifi_sta_is_connected()` reports false, classifies outcomes into 2xx / 4xx / 5xx / transport (4xx is not retried), and logs a stats line every 5 s:
    ```
    HTTP stats 2xx=… 4xx=… 5xx=… transport=… enqueued=… dropped=… exhausted=…
    ```
@@ -128,28 +132,29 @@ All three tasks subscribe to the ESP-IDF task watchdog (TWDT) and feed it once p
 ### Data flow
 
 ```
-HC-SR04 ─► sensor_task ─► current_sample (mutex)   ─► display_task ─► SSD1351 OLED
+HC-SR04 ─► sensor_task ─► current_sample (mutex)         ─► display_task ─► SSD1351 OLED
                        │
-                       └─► http_send_queue ─► http_send_task ─► Flask /api/radar
-                                                                      │
-                                                                      ▼
-                                                                Socket.IO broadcast
-                                                                      │
-                                                                      ▼
-                                                                Web dashboard
+                       └─► http_uploader_enqueue ─► http_uploader_task ─► Flask /api/radar
+                                                                                │
+                                                                                ▼
+                                                                          Socket.IO broadcast
+                                                                                │
+                                                                                ▼
+                                                                          Web dashboard
 ```
 
 ### Thread safety
 
 - `current_sample` (distance, error class, timestamp) is protected by a FreeRTOS mutex (`distance_mutex`) shared between `sensor_task` (writer) and `display_task` (reader).
-- `current_angle`, `wifi_connected`, and the HTTP telemetry counters use C11 `<stdatomic.h>` atomics.
-- The send queue is a FreeRTOS `QueueHandle_t` with non-blocking enqueue and drop-oldest overflow.
-- WiFi connection state is signaled at boot through an `EventGroup` and tracked at runtime via the `wifi_connected` atomic.
+- `current_angle` and the HTTP telemetry counters use C11 `<stdatomic.h>` atomics.
+- The uploader queue is a FreeRTOS `QueueHandle_t` (private to the `http_uploader` component) with non-blocking enqueue and drop-oldest overflow.
+- WiFi connection state is encapsulated in the `wifi_sta` component: an `EventGroup` unblocks the initial bring-up, an internal atomic backs the public `wifi_sta_is_connected()` accessor, and the event handler auto-reconnects on disconnect.
 
 ## Technical Highlights
 
-- **Resilient telemetry pipeline** — unified send queue handles both first attempts and retries through one path, with exponential backoff + jitter, drop-oldest overflow, and outcome-class metrics (2xx / 4xx / 5xx / transport / enqueued / dropped / exhausted).
-- **Decoupled rendering and acquisition** — display task does zero network I/O; sensor task is the single producer feeding both the OLED renderer and the HTTP sender.
+- **Modular component layout** — the project is split into four ESP-IDF components (`ultrasonic`, `ssd1351_driver`, `wifi_sta`, `http_uploader`), each with a clean public API in its own header so the main app stays focused on radar logic.
+- **Resilient telemetry pipeline** — the `http_uploader` component handles both first attempts and retries through one queue, with exponential backoff + jitter, drop-oldest overflow, and outcome-class metrics (2xx / 4xx / 5xx / transport / enqueued / dropped / exhausted).
+- **Decoupled rendering and acquisition** — display task does zero network I/O; sensor task is the single producer feeding both the OLED renderer and the HTTP uploader.
 - **Sensor-side robustness** — driver-level GPIO validation, plausibility window rejecting readings outside the HC-SR04's usable range, 3-sample median filter to kill single-sample glitches, and a freshness check on the consumer to detect a stalled sensor before the TWDT fires.
 - **Validated API surface** — the Flask server rejects malformed payloads with structured 4xx errors instead of storing bad data.
 - **Polar-to-Cartesian conversion** with `cos()` / `sin()` for the sweep animation and blip placement.
@@ -159,9 +164,10 @@ HC-SR04 ─► sensor_task ─► current_sample (mutex)   ─► display_task �
 
 **Real-Time Ultrasonic Radar System (ESP32)**
 - Built a standalone radar system on the **ESP32** using **ESP-IDF (FreeRTOS)**, interfacing an **HC-SR04** ultrasonic sensor and an **SSD1351 RGB OLED** over SPI.
-- Designed a producer/consumer architecture: `sensor_task` is the sole producer feeding `display_task` (mutex-protected snapshot) and `http_send_task` (bounded queue), with mutex- and atomic-based synchronization throughout.
+- Organised the firmware as four reusable **ESP-IDF components** (ultrasonic driver, OLED driver, WiFi station, HTTP uploader) plus a slim main app for radar-specific rendering and orchestration.
+- Designed a producer/consumer architecture: `sensor_task` is the sole producer feeding `display_task` (mutex-protected snapshot) and `http_uploader_task` (bounded queue), with mutex- and atomic-based synchronization throughout.
 - Implemented a **resilient WiFi telemetry pipeline** — JSON HTTP POST with a unified send queue, exponential backoff + jitter, and per-outcome metrics logging.
-- Hardened the firmware with **task watchdog (TWDT) panic-on-timeout, stack-canary overflow detection, plausibility checks, and median filtering** to surface failures loudly instead of letting them rot silently.
+- Hardened the firmware with **task watchdog (TWDT) panic-on-timeout, stack-canary overflow detection, WiFi bring-up timeout reboot, plausibility checks, and median filtering** to surface failures loudly instead of letting them rot silently.
 - Built a **Flask + Socket.IO dashboard** with a validated ingress API and live browser updates over WebSocket.
 - Rendered a 180° ping-pong radar sweep with polar-to-cartesian coordinate math and real-time blip placement.
 - Technologies: **C**, **FreeRTOS**, **ESP-IDF**, **SPI**, **WiFi / HTTP**, **Python**, **Flask**, **Socket.IO**.

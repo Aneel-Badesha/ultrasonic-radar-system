@@ -1,13 +1,8 @@
 /**
  * @file ultrasonic.c
  *
- * ESP-IDF driver for ultrasonic range meters, e.g. HC-SR04, HY-SRF05 and the like
+ * ESP-IDF driver for ultrasonic range sensor HC-SR04
  *
- * Ported from esp-open-rtos
- *
- * Copyright (c) 2016 Ruslan V. Uss <unclerus@gmail.com>
- *
- * BSD Licensed as described in the file LICENSE
  */
 #include "ultrasonic.h"
 #include <freertos/FreeRTOS.h>
@@ -15,21 +10,22 @@
 #include <esp_timer.h>
 #include <esp32/rom/ets_sys.h>
 
-#define TRIGGER_LOW_DELAY 4
-#define TRIGGER_HIGH_DELAY 10
-#define PING_TIMEOUT 6000
-#define ROUNDTRIP_M 5800.0f
-#define ROUNDTRIP_CM 58
+#define TRIGGER_LOW_DELAY  5         // Microseconds to hold trigger low before the pulse
+#define TRIGGER_HIGH_DELAY 10        // Microseconds to hold trigger high
+#define PING_TIMEOUT       6000      // Microseconds to wait for the sensor to start its echo pulse before giving up
+#define ROUNDTRIP_M        5800.0f   // Microseconds per meter of round trip travel at the speed of sound
 
+// Spinlock used to make the trigger and echo timing critical section atomic across cores
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-#define PORT_ENTER_CRITICAL portENTER_CRITICAL(&mux)
-#define PORT_EXIT_CRITICAL portEXIT_CRITICAL(&mux)
+#define PORT_ENTER_CRITICAL portENTER_CRITICAL(&mux)    // Disable interrupts and acquire the spinlock
+#define PORT_EXIT_CRITICAL portEXIT_CRITICAL(&mux)      // Release the spinlock and re-enable interrupts
 
+// True when len microseconds have elapsed since start, used for non-blocking timeouts in busy loops
 #define timeout_expired(start, len) ((esp_timer_get_time() - (start)) >= (len))
 
-#define CHECK_ARG(VAL) do { if (!(VAL)) return ESP_ERR_INVALID_ARG; } while (0)
-#define CHECK(x) do { esp_err_t __; if ((__ = x) != ESP_OK) return __; } while (0)
-#define RETURN_CRITICAL(RES) do { PORT_EXIT_CRITICAL; return RES; } while(0)
+#define CHECK_ARG(VAL) do { if (!(VAL)) return ESP_ERR_INVALID_ARG; } while (0)         // Bail out with ESP_ERR_INVALID_ARG if VAL is falsy
+#define CHECK(x) do { esp_err_t __; if ((__ = x) != ESP_OK) return __; } while (0)      // Propagate any non-OK esp_err_t from x to the caller
+#define RETURN_CRITICAL(RES) do { PORT_EXIT_CRITICAL; return RES; } while(0)            // Exit the spinlock-protected section then return RES
 
 esp_err_t ultrasonic_init(const ultrasonic_sensor_t *dev)
 {
@@ -44,14 +40,13 @@ esp_err_t ultrasonic_init(const ultrasonic_sensor_t *dev)
     return gpio_set_level(dev->trigger_pin, 0);
 }
 
-
-esp_err_t ultrasonic_measure_raw(const ultrasonic_sensor_t *dev, uint32_t max_time_us, uint32_t *time_us)
+static esp_err_t ultrasonic_measure_raw(const ultrasonic_sensor_t *dev, uint32_t max_time_us, uint32_t *time_us)
 {
     CHECK_ARG(dev && time_us);
 
     PORT_ENTER_CRITICAL;
 
-    // 10us trigger pulse with a 4us low guard before it
+    // 10us trigger pulse with a 5us low guard before it
     CHECK(gpio_set_level(dev->trigger_pin, 0));
     ets_delay_us(TRIGGER_LOW_DELAY);
     CHECK(gpio_set_level(dev->trigger_pin, 1));
@@ -94,13 +89,3 @@ esp_err_t ultrasonic_measure(const ultrasonic_sensor_t *dev, float max_distance,
     return ESP_OK;
 }
 
-esp_err_t ultrasonic_measure_cm(const ultrasonic_sensor_t *dev, uint32_t max_distance, uint32_t *distance)
-{
-    CHECK_ARG(dev && distance);
-
-    uint32_t time_us;
-    CHECK(ultrasonic_measure_raw(dev, max_distance * ROUNDTRIP_CM, &time_us));
-    *distance = time_us / ROUNDTRIP_CM;
-
-    return ESP_OK;
-}
