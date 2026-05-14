@@ -10,6 +10,7 @@
 #include <ssd1351.h>
 #include <wifi_sta.h>
 #include <http_uploader.h>
+#include <servo.h>
 #include <esp_err.h>
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -35,13 +36,18 @@
 #define SENSOR_TASK_STACK_SIZE     2048
 #define DISPLAY_TASK_STACK_SIZE    3072
 #define TASK_PRIORITY              5
-#define SENSOR_UPDATE_RATE_MS      100
 #define DISPLAY_UPDATE_RATE_MS     10
 
-// Servo sweep, angles are in the display coordinate frame
-#define SWEEP_ANGLE_START         180
-#define SWEEP_ANGLE_END           360
-#define SWEEP_ANGLE_STEP          2
+// Servo sweep, drives both the physical motor and the displayed sweep position
+#define SERVO_GPIO              25
+#define SERVO_MIN_PULSE_US      500     // SG90 datasheet 0 degrees
+#define SERVO_MAX_PULSE_US      2500    // SG90 datasheet 180 degrees
+#define SWEEP_MIN_DEG           0
+#define SWEEP_MAX_DEG           180
+#define SWEEP_STEP_DEG          2       // Move the servo 2 degrees per cycle
+#define SWEEP_INTERVAL_MS       55      // 90 steps * 55 ms = ~5 seconds per full sweep
+#define SERVO_SETTLE_MS         30      // Wait for the servo to physically arrive before measuring
+#define DISPLAY_ANGLE_OFFSET    180     // Physical 0 maps to display 180 (leftmost on a Y-down screen)
 
 // Radar overlay geometry on the 128x128 OLED
 #define RADAR_CENTER_X     64
@@ -85,7 +91,7 @@ static sensor_sample_t current_sample = {
     .last_error = SENSOR_ERR_NO_ECHO,
     .timestamp_us = 0
 };
-static atomic_int current_angle = 180;       // Latest sweep angle, written by display_task and read by sensor_task
+static atomic_int physical_angle = 0;        // Latest physical servo angle in degrees [0, 180], written by sensor_task and read by display_task
 
 // Static overlay drawn each frame, range rings plus the four axis lines
 static void draw_radar_grid(ssd1351_t *dev)
@@ -125,7 +131,7 @@ static float median3(float a, float b, float c)
     return b;
 }
 
-// FreeRTOS task, polls the ultrasonic sensor at SENSOR_UPDATE_RATE_MS and publishes filtered samples
+// FreeRTOS task, drives the servo sweep and publishes filtered samples tagged with the physical angle
 static void sensor_task(void *pvParameters)
 {
     ultrasonic_sensor_t sensor = {
@@ -142,9 +148,16 @@ static void sensor_task(void *pvParameters)
     }
     int window_idx = 0;
 
+    int target_angle = SWEEP_MIN_DEG;
+    int sweep_step = SWEEP_STEP_DEG;
+
     while (true)
     {
         esp_task_wdt_reset();
+
+        // Command the servo and wait for it to physically arrive before measuring
+        ESP_ERROR_CHECK(servo_set_angle((uint8_t)target_angle));
+        vTaskDelay(pdMS_TO_TICKS(SERVO_SETTLE_MS));
 
         float distance_m;
         esp_err_t res = ultrasonic_measure(&sensor, MAX_DISTANCE_CM / 100.0f, &distance_m);
@@ -161,6 +174,9 @@ static void sensor_task(void *pvParameters)
         window_idx = (window_idx + 1) % SENSOR_FILTER_WINDOW;
         float filtered = median3(window[0], window[1], window[2]);
 
+        // Publish the angle the servo was actually at when the measurement happened
+        atomic_store(&physical_angle, target_angle);
+
         if (xSemaphoreTake(distance_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             current_sample.distance_cm  = filtered;
             current_sample.last_error   = err;
@@ -168,12 +184,9 @@ static void sensor_task(void *pvParameters)
             xSemaphoreGive(distance_mutex);
         }
 
-        // Angle is captured at the measurement instant, not at send time
         if (wifi_sta_is_connected()) {
-            int sweep_angle = atomic_load(&current_angle);
-            int api_angle = sweep_angle - SWEEP_ANGLE_START;
             http_uploader_item_t item = {
-                .angle = api_angle,
+                .angle = target_angle,
                 .distance = filtered,
                 .retry_count = 0
             };
@@ -185,11 +198,20 @@ static void sensor_task(void *pvParameters)
                      (int)err, esp_err_to_name(res));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_UPDATE_RATE_MS));
+        target_angle += sweep_step;
+        if (target_angle >= SWEEP_MAX_DEG) {
+            target_angle = SWEEP_MAX_DEG;
+            sweep_step = -sweep_step;
+        } else if (target_angle <= SWEEP_MIN_DEG) {
+            target_angle = SWEEP_MIN_DEG;
+            sweep_step = -sweep_step;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SWEEP_INTERVAL_MS - SERVO_SETTLE_MS));
     }
 }
 
-// FreeRTOS task, sweeps the radar line and renders detected targets at DISPLAY_UPDATE_RATE_MS
+// FreeRTOS task, renders the sweep line and detected targets reflecting the actual physical servo angle
 static void display_task(void *pvParameters)
 {
     ssd1351_t dev;
@@ -197,8 +219,6 @@ static void display_task(void *pvParameters)
 
     ssd1351_fill_screen(&dev, COLOR_BLACK);
 
-    int angle = SWEEP_ANGLE_START;
-    int step = SWEEP_ANGLE_STEP;
     int prev_x = RADAR_CENTER_X - RADAR_MAX_RADIUS;
     int prev_y = RADAR_CENTER_Y;
 
@@ -211,16 +231,17 @@ static void display_task(void *pvParameters)
         ssd1351_draw_line(&dev, RADAR_CENTER_X, RADAR_CENTER_Y, prev_x, prev_y, COLOR_BLACK);
         draw_radar_grid(&dev);
 
-        // Sweep range [180, 360] maps cos/sin into the upper half on a Y-down screen
-        float rad = angle * M_PI / 180.0;
+        // Physical 0-180 maps to display 180-360, putting the sweep in the upper half on a Y-down screen
+        int phys = atomic_load(&physical_angle);
+        int display_angle = phys + DISPLAY_ANGLE_OFFSET;
+
+        float rad = display_angle * M_PI / 180.0;
         int x = RADAR_CENTER_X + (int)(RADAR_MAX_RADIUS * cos(rad));
         int y = RADAR_CENTER_Y + (int)(RADAR_MAX_RADIUS * sin(rad));
 
         ssd1351_draw_line(&dev, RADAR_CENTER_X, RADAR_CENTER_Y, x, y, COLOR_GREEN);
         prev_x = x;
         prev_y = y;
-
-        atomic_store(&current_angle, angle);
 
         sensor_sample_t snapshot;
         bool have_sample = false;
@@ -246,11 +267,6 @@ static void display_task(void *pvParameters)
             int bx = RADAR_CENTER_X + (int)(r * cos(rad));
             int by = RADAR_CENTER_Y + (int)(r * sin(rad));
             ssd1351_fill_rect(&dev, bx-2, by-2, 5, 5, COLOR_RED);
-        }
-
-        angle += step;
-        if (angle > SWEEP_ANGLE_END || angle < SWEEP_ANGLE_START) {
-            step = -step;
         }
 
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_UPDATE_RATE_MS));
@@ -279,6 +295,16 @@ void app_main()
 
     // Spawn the HTTP uploader before producers so the queue has a drain ready
     http_uploader_init(RPI_SERVER_URL, TASK_PRIORITY - 1);
+
+    // Bring up the servo before sensor_task so the first sweep command lands on a configured channel
+    servo_config_t servo_cfg = {
+        .signal_pin    = SERVO_GPIO,
+        .ledc_timer    = LEDC_TIMER_0,
+        .ledc_channel  = LEDC_CHANNEL_0,
+        .min_pulse_us  = SERVO_MIN_PULSE_US,
+        .max_pulse_us  = SERVO_MAX_PULSE_US,
+    };
+    ESP_ERROR_CHECK(servo_init(&servo_cfg));
 
     ESP_LOGI(TAG, "WiFi connected! Starting tasks...");
 

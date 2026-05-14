@@ -5,14 +5,14 @@ A real-time ultrasonic radar system built on the **ESP32** (ESP-IDF / FreeRTOS) 
 ## Features
 
 - **HC-SR04 Ultrasonic Sensor** for distance measurement (up to 2 m), with plausibility checks and a 3-sample median filter
+- **Servo-driven 180° physical sweep** — an SG90/MG90S/MG996R rotates the HC-SR04 in lockstep with the display so each reading is tagged with the angle it was actually taken at
 - **SSD1351 RGB OLED Display** (128x128, SPI) for local radar visualization
-- **180° Ping-Pong Sweep** animation with distance blips
 - **FreeRTOS Multi-tasking** — sensor, display, and HTTP-uploader tasks decoupled via a mutex and a send queue
 - **Task watchdog (TWDT)** subscribed on every task with panic-on-timeout, plus stack-canary overflow detection
 - **WiFi HTTP telemetry** from the ESP32 to the dashboard (JSON POST)
 - **WiFi station component** with auto-reconnect on disconnect and a bring-up timeout that reboots if the first connection fails
 - **Resilient delivery** — unified send queue with exponential backoff, jitter, drop-oldest overflow policy, and periodic stats logging
-- **Modular component layout** — WiFi station, HTTP uploader, HC-SR04 driver, and OLED driver are each reusable ESP-IDF components
+- **Modular component layout** — servo, WiFi station, HTTP uploader, HC-SR04 driver, and OLED driver are each reusable ESP-IDF components
 - **Flask + Socket.IO dashboard** with real-time browser updates and validated API
 
 ## Hardware Requirements
@@ -22,6 +22,11 @@ A real-time ultrasonic radar system built on the **ESP32** (ESP-IDF / FreeRTOS) 
 - HC-SR04 Ultrasonic Sensor
   - TRIG → GPIO 5
   - ECHO → GPIO 18
+- SG90 / MG90S / MG996R hobby servo (180° travel) — rotates the HC-SR04
+  - Signal → GPIO 25
+  - Vcc    → **external 5 V supply** (do NOT use the ESP32's 3.3 V rail, the inrush current will brown out the MCU)
+  - GND    → common ground with the ESP32
+  - A 100 µF (or larger) decoupling capacitor across the servo's Vcc/GND is strongly recommended
 - SSD1351 128x128 RGB OLED (SPI / HSPI)
   - MOSI → GPIO 13
   - CLK  → GPIO 14
@@ -48,6 +53,7 @@ ultrasonic-radar-system/
 ├── components/
 │   ├── ultrasonic/             # HC-SR04 driver
 │   ├── ssd1351_driver/         # SSD1351 OLED driver, includes generic line and circle primitives
+│   ├── servo/                  # LEDC-based PWM servo driver, angle in degrees
 │   ├── wifi_sta/               # WiFi station bring-up, event-driven reconnect, is-connected accessor
 │   └── http_uploader/          # Queue-backed HTTP POST worker with exponential backoff and stats
 ├── rpi_server/
@@ -117,11 +123,8 @@ Then open `http://<dashboard-host-ip>:5000` in a browser.
 
 ### Tasks (FreeRTOS)
 
-1. **`sensor_task`** (in `main/`) — reads the HC-SR04 at ~10 Hz, classifies the driver error code, applies a plausibility window (`MIN_DISTANCE_CM` ≤ d ≤ `MAX_DISTANCE_CM`), runs a 3-sample median filter, and publishes the result to `current_sample` (distance + error class + timestamp) under a mutex. The same sample is also handed to `http_uploader_enqueue` with the angle captured at the measurement instant.
-2. **`display_task`** (in `main/`) — runs at ~100 Hz, purely as a renderer:
-   - Draws the radar grid (concentric circles, radial lines) on the SSD1351 via `draw_radar_grid`.
-   - Advances a green sweep line between 180° and 360° (ping-pong, matching the screen's Y-down orientation).
-   - Snapshots `current_sample` under the mutex, skips the frame's blip if the mutex isn't acquired within 50 ms, rejects readings older than `SENSOR_FRESHNESS_TIMEOUT_MS`, and paints a red blip along the current sweep angle if the distance is valid.
+1. **`sensor_task`** (in `main/`) — drives the physical sweep. Each cycle it commands the servo to the next angle, waits `SERVO_SETTLE_MS` for the servo to arrive, reads the HC-SR04, classifies the driver error code, applies a plausibility window (`MIN_DISTANCE_CM` ≤ d ≤ `MAX_DISTANCE_CM`), runs a 3-sample median filter, publishes the reading to `current_sample` under a mutex, and writes the angle into the `physical_angle` atomic. The same sample is handed to `http_uploader_enqueue`. Full sweep takes ~5 s at 2° per cycle.
+2. **`display_task`** (in `main/`) — runs at ~100 Hz, purely as a renderer. It reads `physical_angle` (the actual servo position), maps physical 0-180 to display 180-360 to compensate for the screen's Y-down orientation, draws the radar grid via `draw_radar_grid`, draws the green sweep line, snapshots `current_sample` under the mutex (skipping the frame's blip if the mutex isn't acquired within 50 ms), rejects readings older than `SENSOR_FRESHNESS_TIMEOUT_MS`, and paints a red blip along the current sweep angle if the distance is valid.
 3. **`http_uploader_task`** (in the `http_uploader` component) — drains the internal queue for both first attempts (no delay) and retries (exponential backoff 300 ms → 3000 ms cap, ±100 ms jitter). Drops the oldest item on queue overflow, short-circuits when `wifi_sta_is_connected()` reports false, classifies outcomes into 2xx / 4xx / 5xx / transport (4xx is not retried), and logs a stats line every 5 s:
    ```
    HTTP stats 2xx=… 4xx=… 5xx=… transport=… enqueued=… dropped=… exhausted=…
@@ -132,21 +135,22 @@ All three tasks subscribe to the ESP-IDF task watchdog (TWDT) and feed it once p
 ### Data flow
 
 ```
-HC-SR04 ─► sensor_task ─► current_sample (mutex)         ─► display_task ─► SSD1351 OLED
-                       │
-                       └─► http_uploader_enqueue ─► http_uploader_task ─► Flask /api/radar
-                                                                                │
-                                                                                ▼
-                                                                          Socket.IO broadcast
-                                                                                │
-                                                                                ▼
-                                                                          Web dashboard
+                              ┌─► current_sample (mutex)   ─► display_task ─► SSD1351 OLED
+sensor_task ─► servo + HC-SR04┤      physical_angle (atomic) ─► display_task
+                              │
+                              └─► http_uploader_enqueue ─► http_uploader_task ─► Flask /api/radar
+                                                                                       │
+                                                                                       ▼
+                                                                                 Socket.IO broadcast
+                                                                                       │
+                                                                                       ▼
+                                                                                 Web dashboard
 ```
 
 ### Thread safety
 
 - `current_sample` (distance, error class, timestamp) is protected by a FreeRTOS mutex (`distance_mutex`) shared between `sensor_task` (writer) and `display_task` (reader).
-- `current_angle` and the HTTP telemetry counters use C11 `<stdatomic.h>` atomics.
+- `physical_angle` and the HTTP telemetry counters use C11 `<stdatomic.h>` atomics. `physical_angle` is written by `sensor_task` immediately after each successful servo command and read by `display_task` on every render frame.
 - The uploader queue is a FreeRTOS `QueueHandle_t` (private to the `http_uploader` component) with non-blocking enqueue and drop-oldest overflow.
 - WiFi connection state is encapsulated in the `wifi_sta` component: an `EventGroup` unblocks the initial bring-up, an internal atomic backs the public `wifi_sta_is_connected()` accessor, and the event handler auto-reconnects on disconnect.
 
